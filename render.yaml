@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: media-yukla-bot
+    runtime: python
+    plan: free
+    # --upgrade muhim: yt-dlp extractor'lari tez eskiradi, har build'da yangilanadi.
+    buildCommand: pip install --upgrade -r requirements.txt
+    startCommand: python bot.py
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: BOT_TOKEN
+        sync: false
+      - key: MAX_CONCURRENT
+        value: "2"

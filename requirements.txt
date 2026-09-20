@@ -1,0 +1,7 @@
+aiogram>=3.7,<4.0
+aiohttp>=3.9,<4.0
+python-dotenv>=1.0
+# yt-dlp extractor'lari tez-tez buziladi — yangi versiya har doim yaxshiroq.
+yt-dlp>=2025.1.1
+# FFmpeg binary'si shu paket ichida keladi (Render'da apt-get kerak emas).
+imageio-ffmpeg>=0.5.1
