@@ -138,6 +138,64 @@ def download(url: str, workdir: Path) -> Media:
     )
 
 
+def search_songs(query: str, count: int = 16) -> list[dict]:
+    """YouTube qidiruvi natijalari (yuklab olmasdan, tez rejim)."""
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 30,
+        "retries": 3,
+        "extract_flat": True,
+    }
+
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch{count}:{query}", download=False)
+
+    songs = []
+    for entry in (info or {}).get("entries") or []:
+        if not entry or not entry.get("id"):
+            continue
+        songs.append(
+            {
+                "id": entry["id"],
+                "title": (entry.get("title") or entry["id"]).strip(),
+                "duration": int(entry["duration"]) if entry.get("duration") else None,
+            }
+        )
+    return songs
+
+
+def download_audio(video_id: str, workdir: Path) -> Media:
+    """YouTube video id'si bo'yicha faqat audioni yuklab, mp3 qaytaradi. Sinxron — thread'da chaqiring."""
+    opts = _base_opts(workdir)
+    opts.update(
+        {
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "postprocessors": [
+                {
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }
+            ],
+        }
+    )
+
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
+
+    audio = next((p for p in sorted(workdir.iterdir()) if p.suffix.lower() == ".mp3"), None)
+
+    return Media(
+        video=None,
+        audio=audio,
+        title=(info.get("title") or info.get("id") or "media").strip(),
+        uploader=(info.get("uploader") or info.get("channel") or "").strip(),
+        duration=int(info["duration"]) if info.get("duration") else None,
+        platform="YouTube",
+    )
+
+
 def friendly_error(exc: DownloadError) -> str:
     msg = str(exc).lower()
 

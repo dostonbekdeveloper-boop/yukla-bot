@@ -2,14 +2,21 @@ import asyncio
 import contextlib
 import logging
 import os
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ChatAction
-from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
 from dotenv import load_dotenv
 from yt_dlp.utils import DownloadError
 
@@ -33,16 +40,16 @@ router = Router()
 WELCOME = (
     "🎬 Salom! Men @MediaYuklaBot — Instagram, TikTok va YouTube'dan "
     "video va musiqa yuklab beraman.\n\n"
-    "Foydalanish: shunchaki havolani yuboring.\n"
+    "🔗 Havola yuboring — video (mp4) + musiqa (mp3) qaytaraman.\n"
     "Masalan: https://youtu.be/dQw4w9WgXcQ\n\n"
-    "Har bir havola uchun ikkita fayl qaytaraman:\n"
-    "🎬 Video (mp4)\n"
-    "🎵 Musiqa (mp3)\n\n"
+    "🎵 Yoki shunchaki qo'shiq nomini yozing — ro'yxat chiqadi, "
+    "raqamni bosibsiz va mp3 keladi.\n"
+    "Masalan: Yashashga qo'yinglar\n\n"
     "⚠️ Cheklovlar:\n"
     "• Telegram 50 MB dan katta faylni yuborishga ruxsat bermaydi\n"
     "• Shaxsiy (private) va login talab qiladigan videolar yuklanmaydi\n"
     "• Instagram ba'zan kirishni cheklab qo'yadi\n\n"
-    "Buyruqlar: /start — bu xabar, /help — yordam"
+    "Buyruqlar: /start — bu xabar, /help — yordam, /search — qo'shiq qidirish"
 )
 
 
@@ -114,41 +121,27 @@ async def send_files(message: Message, media: downloader.Media) -> None:
             await message.answer(f"⚠️ Mp3 {size // 1_000_000} MB — 50 MB limitidan katta.")
 
 
-@router.message(F.text | F.caption)
-async def handle_link(message: Message, bot: Bot) -> None:
-    # Foydalanuvchi havolani rasm/video ostiga yozib yoki post'ni forward qilib yuborishi mumkin.
-    url = downloader.extract_url(message.text or message.caption or "")
-    if not url:
-        await message.answer(
-            "🔗 Menga havola yuboring.\n\n"
-            "Masalan: https://www.tiktok.com/@user/video/1234567890\n"
-            "Yoki /start bosib yo'riqnoma ko'ring."
-        )
-        return
-
-    platform = downloader.detect_platform(url)
-    if not platform:
-        await message.answer(
-            "❌ Bu saytni qo'llab-quvvatlamayman.\n\n"
-            "Faqat: Instagram, TikTok, YouTube."
-        )
-        return
-
-    status = await message.answer(f"⏳ {platform} dan yuklab olinmoqda...\nBu bir necha soniya vaqt olishi mumkin.")
-    pulse_task = asyncio.create_task(pulse(bot, message.chat.id, ChatAction.UPLOAD_VIDEO))
-
+async def _fetch_and_send(
+    message: Message,
+    bot: Bot,
+    status: Message,
+    label: str,
+    empty_text: str,
+    work: Callable[[Path], downloader.Media],
+    action: str = ChatAction.UPLOAD_VIDEO,
+) -> None:
+    pulse_task = asyncio.create_task(pulse(bot, message.chat.id, action))
     try:
         async with DOWNLOAD_SLOTS:
             with TemporaryDirectory(prefix="mediabot_") as tmp:
                 try:
-                    media = await asyncio.to_thread(downloader.download, url, Path(tmp))
+                    media = await asyncio.to_thread(work, Path(tmp))
                 except DownloadError as exc:
-                    log.warning("Download failed for %s: %s", url, exc)
+                    log.warning("Download failed for %s: %s", label, exc)
                     await status.edit_text(downloader.friendly_error(exc))
                     return
                 except Exception:
-                    # FFmpeg yo'q, disk to'lgan, tarmoq uzilgan va h.k.
-                    log.exception("Unexpected error while downloading %s", url)
+                    log.exception("Unexpected error while processing %s", label)
                     await status.edit_text(
                         "😔 Kutilmagan xatolik yuz berdi.\n"
                         "Bir necha daqiqadan so'ng qayta urinib ko'ring."
@@ -156,17 +149,14 @@ async def handle_link(message: Message, bot: Bot) -> None:
                     return
 
                 if not media.video and not media.audio:
-                    await status.edit_text(
-                        "😔 Havola ochildi, lekin ichidan video yoki audio topilmadi. "
-                        "Bu rasm bo'lishi yoki video o'chirilgan bo'lishi mumkin."
-                    )
+                    await status.edit_text(empty_text)
                     return
 
                 await status.edit_text("📤 Fayllar yuborilmoqda...")
                 try:
                     await send_files(message, media)
                 except Exception:
-                    log.exception("Failed to send media for %s", url)
+                    log.exception("Failed to send media for %s", label)
                     await message.answer("😔 Fayllarni yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
                 with contextlib.suppress(Exception):
                     await status.delete()
@@ -176,10 +166,159 @@ async def handle_link(message: Message, bot: Bot) -> None:
             await pulse_task
 
 
+PAGE_SIZE = 8
+
+# Har chat uchun oxirgi qidiruv: (so'rov, natijalar). Restart'da tozalanadi.
+search_cache: dict[int, tuple[str, list[dict]]] = {}
+
+
+def results_text(query: str, results: list[dict], page: int) -> str:
+    lines = [query, ""]
+    start = page * PAGE_SIZE
+    for i, item in enumerate(results[start : start + PAGE_SIZE], start=start + 1):
+        lines.append(f"{i}. {item['title']}  {fmt_duration(item['duration'])}")
+    return "\n".join(lines)[:4096]
+
+
+def results_keyboard(results: list[dict], page: int) -> InlineKeyboardMarkup:
+    start = page * PAGE_SIZE
+    chunk = results[start : start + PAGE_SIZE]
+    rows = [
+        [
+            InlineKeyboardButton(text=str(start + j + 1), callback_data=f"song:{start + j}")
+            for j in range(i, min(i + 5, len(chunk)))
+        ]
+        for i in range(0, len(chunk), 5)
+    ]
+    if start + PAGE_SIZE < len(results):
+        rows.append([InlineKeyboardButton(text="➡️ Keyingi", callback_data=f"page:{page + 1}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def run_search(message: Message, query: str) -> None:
+    status = await message.answer(f"🔎 «{query}» qidirilmoqda...")
+    try:
+        results = await asyncio.to_thread(downloader.search_songs, query)
+    except DownloadError as exc:
+        log.warning("Search failed for %r: %s", query, exc)
+        await status.edit_text(downloader.friendly_error(exc))
+        return
+    except Exception:
+        log.exception("Unexpected error while searching %r", query)
+        await status.edit_text(
+            "😔 Kutilmagan xatolik yuz berdi.\n"
+            "Bir necha daqiqadan so'ng qayta urinib ko'ring."
+        )
+        return
+
+    if not results:
+        await status.edit_text(f"😔 «{query}» bo'yicha hech narsa topilmadi.")
+        return
+
+    search_cache[message.chat.id] = (query, results)
+    with contextlib.suppress(Exception):
+        await status.delete()
+    await message.answer(
+        results_text(query, results, 0),
+        reply_markup=results_keyboard(results, 0),
+    )
+
+
+# handle_text'dan OLDIN ro'yxatdan o'tishi kerak: "/search ..." ham matn bo'lgani
+# uchun aks holda F.text filtri uni ushlab qoladi.
+@router.message(Command("search"))
+async def cmd_search(message: Message, command: CommandObject) -> None:
+    query = (command.args or "").strip()
+    if not query:
+        await message.answer(
+            "🔎 Qo'shiq nomini yozing.\n\n"
+            "Masalan: /search Sevara Yorqinim\n"
+            "Yoki shunchaki qo'shiq nomini yozing — komandasiz ham ishlaydi."
+        )
+        return
+    await run_search(message, query)
+
+
+@router.callback_query(F.data.startswith("page:"))
+async def cb_page(call: CallbackQuery) -> None:
+    cached = search_cache.get(call.message.chat.id)
+    if not cached:
+        await call.answer("Qidiruv eskirgan — qo'shiq nomini qayta yozing.")
+        return
+    page = int(call.data.split(":")[1])
+    query, results = cached
+    with contextlib.suppress(Exception):
+        await call.message.edit_text(
+            results_text(query, results, page),
+            reply_markup=results_keyboard(results, page),
+        )
+    await call.answer()
+
+
+@router.callback_query(F.data.startswith("song:"))
+async def cb_song(call: CallbackQuery, bot: Bot) -> None:
+    cached = search_cache.get(call.message.chat.id)
+    idx = int(call.data.split(":")[1])
+    if not cached or idx >= len(cached[1]):
+        await call.answer("Qidiruv eskirgan — qo'shiq nomini qayta yozing.")
+        return
+    item = cached[1][idx]
+    await call.answer()
+    status = await call.message.answer(f"⏳ «{item['title']}» yuklanmoqda...")
+    await _fetch_and_send(
+        call.message,
+        bot,
+        status,
+        item["id"],
+        "😔 Audio topilmadi. Boshqa raqamni tanlab ko'ring.",
+        lambda workdir: downloader.download_audio(item["id"], workdir),
+        action=ChatAction.UPLOAD_AUDIO,
+    )
+
+
+@router.message(F.text | F.caption)
+async def handle_text(message: Message, bot: Bot) -> None:
+    text = message.text or message.caption or ""
+    url = downloader.extract_url(text)
+
+    # Havola bo'lmasa — xabarni qo'shiq nomi deb qabul qilamiz.
+    if not url:
+        query = text.strip()
+        if len(query) < 2:
+            await message.answer(
+                "🔗 Havola yoki 🎵 qo'shiq nomini yuboring.\n\n"
+                "Masalan: https://www.tiktok.com/@user/video/1234567890\n"
+                "Yoki: Yashashga qo'yinglar"
+            )
+            return
+        await run_search(message, query)
+        return
+
+    # Foydalanuvchi havolani rasm/video ostiga yozib yoki post'ni forward qilib yuborishi mumkin.
+    platform = downloader.detect_platform(url)
+    if not platform:
+        await message.answer(
+            "❌ Bu saytni qo'llab-quvvatlamayman.\n\n"
+            "Faqat: Instagram, TikTok, YouTube."
+        )
+        return
+
+    status = await message.answer(f"⏳ {platform} dan yuklab olinmoqda...\nBu bir necha soniya vaqt olishi mumkin.")
+    await _fetch_and_send(
+        message,
+        bot,
+        status,
+        url,
+        "😔 Havola ochildi, lekin ichidan video yoki audio topilmadi. "
+        "Bu rasm bo'lishi yoki video o'chirilgan bo'lishi mumkin.",
+        lambda workdir: downloader.download(url, workdir),
+    )
+
+
 @router.message()
 async def handle_other(message: Message) -> None:
     """Matn/caption bo'lmagan xabarlar (rasm, stiker, ovozli) uchun."""
-    await message.answer("🔗 Menga Instagram, TikTok yoki YouTube havolasini yuboring.")
+    await message.answer("🔗 Havola yoki 🎵 qo'shiq nomini yuboring.")
 
 
 async def health(request: web.Request) -> web.Response:
